@@ -87,7 +87,6 @@ struct DispatchIndirect {
 struct SortInfos {
     keys_size: atomic<u32>,     // essentially contains the same info as instance_count in DrawIndirect
     padded_size: u32,
-    passes: u32,
     even_pass: u32,
     odd_pass: u32,
 }

@@ -27,6 +27,10 @@ pub struct GPURSSorter {
     zero_p: wgpu::ComputePipeline,
     histogram_p: wgpu::ComputePipeline,
     prefix_p: wgpu::ComputePipeline,
+    block_histogram_even_p: wgpu::ComputePipeline,
+    block_histogram_odd_p: wgpu::ComputePipeline,
+    block_offsets_even_p: wgpu::ComputePipeline,
+    block_offsets_odd_p: wgpu::ComputePipeline,
     scatter_even_p: wgpu::ComputePipeline,
     scatter_odd_p: wgpu::ComputePipeline,
     subgroup_size: usize,
@@ -51,7 +55,6 @@ pub struct IndirectDispatch {
 pub struct GeneralInfo {
     pub keys_size: u32,
     pub padded_size: u32,
-    pub passes: u32,
     pub even_pass: u32,
     pub odd_pass: u32,
 }
@@ -262,6 +265,38 @@ impl GPURSSorter {
             compilation_options: Default::default(),
             cache: None,
         });
+        let block_histogram_even_p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("calculate_block_histogram_even"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("calculate_block_histogram_even"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let block_histogram_odd_p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("calculate_block_histogram_odd"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("calculate_block_histogram_odd"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let block_offsets_even_p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("calculate_block_offsets_even"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("calculate_block_offsets_even"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let block_offsets_odd_p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("calculate_block_offsets_odd"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("calculate_block_offsets_odd"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
         let scatter_even_p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("scatter_even"),
             layout: Some(&pipeline_layout),
@@ -286,6 +321,10 @@ impl GPURSSorter {
             zero_p,
             histogram_p,
             prefix_p,
+            block_histogram_even_p,
+            block_histogram_odd_p,
+            block_offsets_even_p,
+            block_offsets_odd_p,
             scatter_even_p,
             scatter_odd_p,
             subgroup_size: histogram_sg_size,
@@ -574,7 +613,8 @@ impl GPURSSorter {
 
         let histo_size = RS_RADIX_SIZE * std::mem::size_of::<u32>();
 
-        let internal_size = (RS_KEYVAL_SIZE + scatter_blocks_ru - 1 + 1) * histo_size; // +1 safety
+        // Global histograms + block histograms + block offsets
+        let internal_size = (RS_KEYVAL_SIZE + 2 * scatter_blocks_ru) * histo_size;
 
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Internal radix sort buffer"),
@@ -585,7 +625,7 @@ impl GPURSSorter {
             mapped_at_creation: false,
         });
         return buffer;
-    }
+}
 
     pub fn create_bind_group(
         &self,
@@ -612,7 +652,6 @@ impl GPURSSorter {
         let uniform_infos = GeneralInfo {
             keys_size: keysize as u32,
             padded_size: count_ru_histo as u32,
-            passes: 4,
             even_pass: 0,
             odd_pass: 0,
         };
@@ -814,25 +853,124 @@ impl GPURSSorter {
         keysize: usize,
         encoder: &mut wgpu::CommandEncoder,
     ) {
-        assert!(passes == 4); // currently the amount of passes is hardcoded in the shader
+        assert!(passes == 4);
         let (_, scatter_blocks_ru, _, _, _, _) = Self::get_scatter_histogram_sizes(keysize);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("Scatter keyvals"),
-            timestamp_writes: None,
-        });
 
-        pass.set_bind_group(0, bind_group, &[]);
-        pass.set_pipeline(&self.scatter_even_p);
-        pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+        // Pass 0 (even)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block histogram even pass 0"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.block_histogram_even_p);
+            pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block offsets even pass 0"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.block_offsets_even_p);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("scatter even pass 0"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.scatter_even_p);
+            pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+        }
 
-        pass.set_pipeline(&self.scatter_odd_p);
-        pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+        // Pass 1 (odd)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block histogram odd pass 1"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.block_histogram_odd_p);
+            pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block offsets odd pass 1"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.block_offsets_odd_p);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("scatter odd pass 1"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.scatter_odd_p);
+            pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+        }
 
-        pass.set_pipeline(&self.scatter_even_p);
-        pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+        // Pass 2 (even)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block histogram even pass 2"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.block_histogram_even_p);
+            pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block offsets even pass 2"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.block_offsets_even_p);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("scatter even pass 2"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.scatter_even_p);
+            pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+        }
 
-        pass.set_pipeline(&self.scatter_odd_p);
-        pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+        // Pass 3 (odd)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block histogram odd pass 3"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.block_histogram_odd_p);
+            pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block offsets odd pass 3"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.block_offsets_odd_p);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("scatter odd pass 3"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.scatter_odd_p);
+            pass.dispatch_workgroups(scatter_blocks_ru as u32, 1, 1);
+        }
     }
     pub fn record_scatter_keys_indirect(
         &self,
@@ -843,23 +981,121 @@ impl GPURSSorter {
     ) {
         assert!(passes == 4);
 
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("Scatter keyvals"),
-            timestamp_writes: None,
-        });
+        // Pass 0 (even)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block histogram even pass 0"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.block_histogram_even_p);
+            pass.dispatch_workgroups_indirect(dispatch_buffer, 0);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block offsets even pass 0"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.block_offsets_even_p);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("scatter even pass 0"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.scatter_even_p);
+            pass.dispatch_workgroups_indirect(dispatch_buffer, 0);
+        }
 
-        pass.set_bind_group(0, bind_group, &[]);
-        pass.set_pipeline(&self.scatter_even_p);
-        pass.dispatch_workgroups_indirect(dispatch_buffer, 0);
+        // Pass 1 (odd)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block histogram odd pass 1"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.block_histogram_odd_p);
+            pass.dispatch_workgroups_indirect(dispatch_buffer, 0);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block offsets odd pass 1"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.block_offsets_odd_p);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("scatter odd pass 1"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.scatter_odd_p);
+            pass.dispatch_workgroups_indirect(dispatch_buffer, 0);
+        }
 
-        pass.set_pipeline(&self.scatter_odd_p);
-        pass.dispatch_workgroups_indirect(dispatch_buffer, 0);
+        // Pass 2 (even)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block histogram even pass 2"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.block_histogram_even_p);
+            pass.dispatch_workgroups_indirect(dispatch_buffer, 0);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block offsets even pass 2"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.block_offsets_even_p);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("scatter even pass 2"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.scatter_even_p);
+            pass.dispatch_workgroups_indirect(dispatch_buffer, 0);
+        }
 
-        pass.set_pipeline(&self.scatter_even_p);
-        pass.dispatch_workgroups_indirect(dispatch_buffer, 0);
-
-        pass.set_pipeline(&self.scatter_odd_p);
-        pass.dispatch_workgroups_indirect(dispatch_buffer, 0);
+        // Pass 3 (odd)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block histogram odd pass 3"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.block_histogram_odd_p);
+            pass.dispatch_workgroups_indirect(dispatch_buffer, 0);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("block offsets odd pass 3"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.block_offsets_odd_p);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("scatter odd pass 3"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(&self.scatter_odd_p);
+            pass.dispatch_workgroups_indirect(dispatch_buffer, 0);
+        }
     }
 
     pub fn record_sort(
